@@ -212,7 +212,7 @@ def main():
     content, csweep = _load("content_replay.json"), _load("content_sweep.json")
     if content and csweep:
         plot_content(content, csweep, md)
-    runs = _load("agent_runs.jsonl")
+    runs = [r for r in (_load("agent_runs.jsonl") or []) if not r.get("error")]
     if runs:
         plot_agent(runs, md)
     with open(os.path.join(RES, "tables.md"), "w") as handle:

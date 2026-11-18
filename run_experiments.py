@@ -10,6 +10,10 @@ INSTRUCTIONS.md, history.jsonl, task.json, any reference file (citations' db.jso
 for corpus datasets, the task's scenario files. hidden/ is never copied or read; only
 verify.py reads it, as a subprocess, after the answer is written.
 
+Runs resume: tasks already in --out are skipped (and replayed into the task-reuse index), so
+a run stopped by an API quota can simply be started again with the same command. A task the
+model API refuses is retried after --wait seconds; it is never logged as a failed task.
+
 Example:
     python run_experiments.py --assignment ../Assignment2_COMP_580 --spartacus ../Spartacus \
         --datasets tickets configs --configs baseline task content both
@@ -119,41 +123,82 @@ def run_agent(workdir, model, max_turns, use_content):
     return metrics
 
 
-def run(dataset, config, args):
+class ProviderUnavailable(RuntimeError):
+    """The model API kept refusing (quota or network); stop so a later rerun can resume."""
+
+
+def is_provider_error(message):
+    return any(code in message for code in ("HTTP 429", "HTTP 500", "HTTP 502", "HTTP 503", "HTTP 529",
+                                            "unreachable"))
+
+
+def load_done(path):
+    """Rows already finished in an earlier run, keyed by (dataset, config, tid)."""
+    done = {}
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                if line.strip():
+                    row = json.loads(line)
+                    if not row.get("error"):
+                        done[(row["dataset"], row["config"], row["tid"])] = row
+    return done
+
+
+def run(dataset, config, args, done):
     dataset_dir = os.path.join(args.assignment, "assignment2", "datasets", dataset)
     env = os.path.join(dataset_dir, "env")
     use_task, use_content = config in ("task", "both"), config in ("content", "both")
     policy = TaskReusePolicy(dataset, env, threshold=args.threshold) if use_task else None
     tasks = load_tasks(env)[:args.limit] if args.limit else load_tasks(env)
     for task in tasks:
+        earlier = done.get((dataset, config, task["tid"]))
+        if earlier:                       # resume: replay what the policy had indexed, then skip
+            if policy and earlier["passed"] and not earlier["reused"] and "answer" in earlier:
+                policy.record(task, earlier["answer"])
+            continue
         row = {"dataset": dataset, "config": config, "tid": task["tid"], "reused": False,
                "model_requests": 0, "tool_calls": 0, "input_tokens": 0, "output_tokens": 0,
                "lookup_s": 0.0, "content_s": 0.0}
         start = time.perf_counter()
-        workdir = make_workdir(env, task)
-        answer_path = os.path.join(workdir, "answer.json")
         decision = {"reuse": False}
         if policy:
             t0 = time.perf_counter()
             decision = policy.lookup(task)
             row["lookup_s"] = time.perf_counter() - t0
             row["reuse_reason"] = decision["reason"]
-        if decision["reuse"]:
-            row.update(reused=True, reuse_source=decision["source"], similarity=decision["similarity"])
-            with open(answer_path, "w", encoding="utf-8") as handle:
-                json.dump(decision["answer"], handle)
-        else:
-            row.update(run_agent(workdir, args.model, args.max_turns, use_content))
+        for attempt in range(args.retries + 1):
+            workdir = make_workdir(env, task)
+            answer_path = os.path.join(workdir, "answer.json")
+            if decision["reuse"]:
+                row.update(reused=True, reuse_source=decision["source"], similarity=decision["similarity"])
+                with open(answer_path, "w", encoding="utf-8") as handle:
+                    json.dump(decision["answer"], handle)
+                break
+            metrics = run_agent(workdir, args.model, args.max_turns, use_content)
+            if not is_provider_error(metrics.get("error", "")):
+                row.update(metrics)
+                break
+            shutil.rmtree(workdir, ignore_errors=True)
+            if attempt == args.retries:
+                raise ProviderUnavailable(metrics["error"][:300])
+            print("  model API refused (%s); waiting %ds and retrying %s" % (
+                metrics["error"][:60], args.wait, task["tid"]), flush=True)
+            time.sleep(args.wait)
+            start = time.perf_counter()   # waiting for quota is not the agent's completion time
         row["passed"] = verify(dataset_dir, task["tid"], answer_path)
         row["seconds"] = time.perf_counter() - start
-        if policy and row["passed"] and not row["reused"]:
+        if row["passed"] and not row["reused"]:
             with open(answer_path, encoding="utf-8") as handle:
-                policy.record(task, json.load(handle))     # index only verified answers
+                row["answer"] = json.load(handle)
+            if policy:
+                policy.record(task, row["answer"])     # index only verified answers
         shutil.rmtree(workdir, ignore_errors=True)
         print("%-9s %-8s %s %s reused=%s tools=%d req=%d in_tok=%d %.1fs" % (
             dataset, config, task["tid"], "PASS" if row["passed"] else "FAIL", row["reused"],
             row["tool_calls"], row["model_requests"], row["input_tokens"], row["seconds"]), flush=True)
         yield row
+
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -165,16 +210,27 @@ def main(argv=None):
     parser.add_argument("--max-turns", type=int, default=40)
     parser.add_argument("--threshold", type=float, default=None, help="override the per-dataset threshold")
     parser.add_argument("--limit", type=int, default=0, help="only the first N tasks (0 = all)")
+    parser.add_argument("--retries", type=int, default=5, help="retries per task when the API refuses")
+    parser.add_argument("--wait", type=int, default=65, help="seconds to wait before such a retry")
     parser.add_argument("--out", default=os.path.join(HERE, "results", "agent_runs.jsonl"))
     args = parser.parse_args(argv)
     sys.path.insert(0, os.path.abspath(args.spartacus))
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
+    done = load_done(args.out)
+    if done:
+        print("resuming: %d finished tasks found in %s" % (len(done), args.out), flush=True)
     with open(args.out, "a", encoding="utf-8") as out:
-        for dataset in args.datasets:
-            for config in args.configs:
-                for row in run(dataset, config, args):
-                    out.write(json.dumps(row) + "\n")
-                    out.flush()
+        try:
+            for dataset in args.datasets:
+                for config in args.configs:
+                    for row in run(dataset, config, args, done):
+                        out.write(json.dumps(row) + "\n")
+                        out.flush()
+        except ProviderUnavailable as error:
+            print("\nStopped: the model API is still refusing requests (%s).\n"
+                  "Finished tasks are saved; rerun the same command later to resume." % error)
+            sys.exit(2)
+    print("all done")
 
 
 if __name__ == "__main__":

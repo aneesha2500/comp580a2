@@ -40,12 +40,14 @@ python3 offline_eval.py --assignment ../Assignment2_COMP_580 --spartacus ../Spar
 # 3. agent runs: 8 datasets x 4 configurations, gemini-3.5-flash-lite
 python3 run_experiments.py --assignment ../Assignment2_COMP_580 --spartacus ../Spartacus \
     --datasets tickets bugs docs hosts configs code revisions logs \
-    --configs baseline task content both --model gemini-3.5-flash-lite
+    --configs baseline task content both --model gemini-3.5-flash-lite --limit 15
 
 # 4. plots and tables
 python3 make_plots.py
 ```
 
-Add `--limit 20` to step 3 for a cheaper run on the first 20 tasks of each dataset. `--threshold 0.5` overrides the per-dataset task-reuse threshold for a threshold experiment.
+Step 3 can be stopped and restarted: tasks already in `results/agent_runs.jsonl` are skipped, so if the Gemini quota runs out, run the same command again later and it picks up where it stopped. A task the API refuses (HTTP 429/5xx) is retried after a wait and is never logged as a failure.
+
+The report uses `--limit 15` (the first 15 tasks of each dataset, by `seq`) to fit the free-tier Gemini quota. `--threshold 0.5` overrides the per-dataset task-reuse threshold for a threshold experiment.
 
 All randomness is fixed: the MinHash hash functions use seed 580, task order is by `seq`, and the datasets are fixed by their generators' seeds.
