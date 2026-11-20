@@ -129,7 +129,8 @@ class ProviderUnavailable(RuntimeError):
 
 def is_provider_error(message):
     return any(code in message for code in ("HTTP 429", "HTTP 500", "HTTP 502", "HTTP 503", "HTTP 529",
-                                            "unreachable"))
+                                            "unreachable", "Connection reset", "ConnectionError",
+                                            "RemoteDisconnected", "IncompleteRead", "timed out"))
 
 
 def load_done(path):
