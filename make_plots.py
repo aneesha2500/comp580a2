@@ -125,7 +125,18 @@ def plot_minhash(acc, md):
     md.append("MinHash estimate vs exact Jaccard: mean absolute error %.4f over %d pairs.\n" % (mae, len(acc)))
 
 
+def _common_tasks(runs):
+    """Keep, per dataset, only tasks finished in every configuration run on it, so the
+    configurations are always compared on exactly the same tasks."""
+    tids = defaultdict(lambda: defaultdict(set))
+    for r in runs:
+        tids[r["dataset"]][r["config"]].add(r["tid"])
+    keep = {ds: set.intersection(*by_cfg.values()) for ds, by_cfg in tids.items()}
+    return [r for r in runs if r["tid"] in keep[r["dataset"]]]
+
+
 def plot_agent(runs, md):
+    runs = _common_tasks(runs)
     agg = defaultdict(lambda: defaultdict(float))
     for r in runs:
         a = agg[(r["dataset"], r["config"])]
