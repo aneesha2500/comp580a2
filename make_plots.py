@@ -8,6 +8,7 @@ run_experiments.py, which needs a Gemini key).
 
 import json
 import os
+import statistics
 from collections import defaultdict
 
 import matplotlib
@@ -138,16 +139,22 @@ def _common_tasks(runs):
 def plot_agent(runs, md):
     runs = _common_tasks(runs)
     agg = defaultdict(lambda: defaultdict(float))
+    times = defaultdict(list)
     for r in runs:
         a = agg[(r["dataset"], r["config"])]
         a["n"] += 1
         a["passed"] += r["passed"]
         a["reused"] += r["reused"]
-        for k in ("tool_calls", "model_requests", "input_tokens", "seconds", "lookup_s", "content_s"):
+        for k in ("tool_calls", "model_requests", "input_tokens", "lookup_s", "content_s"):
             a[k] += r.get(k, 0)
+        times[(r["dataset"], r["config"])].append(r["seconds"])
+    # Total time = n x median task time: a few calls hung for the API's 600 s timeout, and a
+    # mean or a plain sum would let those outliers decide the time comparison.
+    for key, a in agg.items():
+        a["seconds"] = a["n"] * statistics.median(times[key])
     datasets = [d for d in CHOSEN if any((d, c) in agg for c in CONFIGS)]
     md.append("## Agent runs (gemini-3.5-flash-lite)\n")
-    md.append("| dataset | config | accuracy | reused | tool calls | model requests | input tokens | time (s) | MinHash overhead (s) |")
+    md.append("| dataset | config | accuracy | reused | tool calls | model requests | input tokens | time (s, n x median) | MinHash overhead (s) |")
     md.append("|---|---|---|---|---|---|---|---|---|")
     for ds in datasets:
         for c in CONFIGS:
@@ -156,6 +163,18 @@ def plot_agent(runs, md):
                 md.append("| %s | %s | %.1f%% | %d | %d | %d | %d | %.0f | %.2f |" % (
                     ds, c, 100 * a["passed"] / a["n"], a["reused"], a["tool_calls"], a["model_requests"],
                     a["input_tokens"], a["seconds"], a["lookup_s"] + a["content_s"]))
+    md.append("")
+    md.append("### All 8 datasets combined\n")
+    md.append("| config | accuracy | reused | tool calls | model requests | input tokens | time (s, n x median) | MinHash overhead (s) |")
+    md.append("|---|---|---|---|---|---|---|---|")
+    for c in CONFIGS:
+        rows = [agg[(d, c)] for d in datasets if (d, c) in agg]
+        n = sum(a["n"] for a in rows)
+        tot = {k: sum(a[k] for a in rows) for k in ("passed", "reused", "tool_calls", "model_requests",
+                                                     "input_tokens", "seconds", "lookup_s", "content_s")}
+        md.append("| %s | %.1f%% | %d | %d | %d | %d | %.0f | %.2f |" % (
+            c, 100 * tot["passed"] / n, tot["reused"], tot["tool_calls"], tot["model_requests"],
+            tot["input_tokens"], tot["seconds"], tot["lookup_s"] + tot["content_s"]))
     md.append("")
 
     metrics = [("passed", "accuracy (%)"), ("input_tokens", "input tokens"), ("tool_calls", "tool calls"),
@@ -193,21 +212,28 @@ def plot_agent(runs, md):
     ax.legend()
     _save(fig, "efficiency_vs_correctness.png")
 
-    fig, ax = plt.subplots(figsize=(6, 4))
-    over, save = [], []
-    for c in ("task", "content", "both"):
-        o = sum(agg[(d, c)]["lookup_s"] + agg[(d, c)]["content_s"] for d in datasets if (d, c) in agg)
-        s = sum(agg[(d, "baseline")]["seconds"] - agg[(d, c)]["seconds"] for d in datasets
-                if (d, c) in agg and (d, "baseline") in agg)
-        over.append(o)
-        save.append(s)
-    ax.bar([0, 1, 2], save, 0.4, label="time saved vs baseline (s)")
-    ax.bar([0.4, 1.4, 2.4], over, 0.4, label="MinHash overhead (s)")
-    ax.set_xticks([0.2, 1.2, 2.2])
-    ax.set_xticklabels(["task", "content", "both"])
-    ax.set(title="Computational overhead vs savings")
-    ax.grid(axis="y", alpha=0.3)
-    ax.legend()
+    # Overhead vs savings, both per task. Savings are in model work (requests, input tokens)
+    # rather than seconds: the API's latency changed a lot between days, which would swamp
+    # a wall-clock comparison across configurations run on different days.
+    fig, axes = plt.subplots(1, 3, figsize=(12, 3.8))
+    labels, over_ms, req_saved, tok_saved = ["task", "content", "both"], [], [], []
+    base_n = sum(agg[(d, "baseline")]["n"] for d in datasets)
+    base_req = sum(agg[(d, "baseline")]["model_requests"] for d in datasets) / base_n
+    base_tok = sum(agg[(d, "baseline")]["input_tokens"] for d in datasets) / base_n
+    for c in labels:
+        n = sum(agg[(d, c)]["n"] for d in datasets)
+        over_ms.append(1000 * sum(agg[(d, c)]["lookup_s"] + agg[(d, c)]["content_s"] for d in datasets) / n)
+        req_saved.append(base_req - sum(agg[(d, c)]["model_requests"] for d in datasets) / n)
+        tok_saved.append((base_tok - sum(agg[(d, c)]["input_tokens"] for d in datasets) / n) / 1000)
+    for ax, vals, title in zip(axes, (over_ms, req_saved, tok_saved),
+                               ("MinHash overhead (ms per task)", "model requests saved per task",
+                                "input tokens saved per task (thousands)")):
+        ax.bar(labels, vals, color=["#4C72B0", "#55A868", "#C44E52"])
+        ax.axhline(0, color="k", linewidth=0.8)
+        ax.set_title(title, fontsize=10)
+        ax.grid(axis="y", alpha=0.3)
+    fig.suptitle("Computational overhead vs savings (all 8 datasets, vs baseline)")
+    fig.tight_layout()
     _save(fig, "overhead_vs_savings.png")
 
 
